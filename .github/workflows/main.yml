@@ -1,0 +1,26 @@
+name: Auto Live Trading Bot
+
+on:
+  schedule:
+    # सोमवार से शुक्रवार सुबह ठीक 9:10 AM IST (3:40 UTC) पर अपने आप चालू होगा
+    - cron: '40 3 * * 1-5'
+  workflow_dispatch: # जब मन करे तब 1 क्लिक में चालू करने का बटन
+
+jobs:
+  run-trading-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Libraries
+        run: pip install yfinance pandas numpy requests
+
+      - name: Start Trading Bot
+        run: python bot.py
