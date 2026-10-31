@@ -14,8 +14,8 @@ CHAT_ID   = "5610520408"
 
 TOTAL_CAPITAL      = 100000   # आपकी कुल पूंजी (₹1,00,000)
 RISK_PER_TRADE_PCT = 1.0      # एक ट्रेड में सिर्फ 1% रिस्क (₹1,000)
-MAX_TRADES_PER_DAY = 3        # दिन में अधिकतम 3 ट्रेंडिंग ट्रेड
-ADX_THRESHOLD      = 20       # 20 से नीचे होने पर मार्केट साइडवेज माना जाएगा
+MAX_TRADES_PER_DAY = 3        # पूरे दिन में अधिकतम 3 ट्रेड
+ADX_THRESHOLD      = 20       # 20 से नीचे मतलब साइडवेज मार्केट
 
 INDICES = {
     "NIFTY 50": {"symbol": "^NSEI", "lot_size": 75, "kite_name": "NIFTY"},
@@ -24,16 +24,27 @@ INDICES = {
     "MIDCAP NIFTY": {"symbol": "NIFTY_MID_SELECT.NS", "lot_size": 120, "kite_name": "MIDCPNIFTY"}
 }
 
-last_alert_sent = {name: None for name in INDICES}
+# सिस्टम मेमोरी
+last_candle_traded = {name: None for name in INDICES}
 trades_today = 0
 last_update_id = 0
 daily_trades_log = []
 
 def get_ist_now():
-    """क्लाउड सर्वर पर भारतीय समय (IST) निकालने का फंक्शन"""
+    """भारतीय समय (IST) निकालने का फंक्शन"""
     return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
 current_day = get_ist_now().date()
+
+def is_market_open():
+    """चेक करेगा कि क्या अभी असली मार्केट खुला है (सोम-शुक्र, 9:15 AM से 3:30 PM)"""
+    now = get_ist_now()
+    # 5 = Saturday, 6 = Sunday
+    if now.weekday() >= 5:
+        return False
+    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_start <= now <= market_end
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -44,12 +55,14 @@ def send_telegram_message(message):
         print(f"Telegram Send Error: {e}")
 
 def get_trades_scoreboard():
+    """तीनों ट्रेड्स का साफ और खुला-खुला स्कोरबोर्ड"""
     if not daily_trades_log:
-        return "📋 <b>आज का ट्रेड स्कोरबोर्ड:</b> अभी तक कोई ट्रेड नहीं लिया गया है।"
-    board = "📋 <b>आज के ट्रेड्स का लाइव रिजल्ट (Scoreboard):</b>\n"
+        return "📋 <b>आज के ट्रेड्स का हाल:</b>\n\n• अभी कोई ट्रेड नहीं लिया गया है।"
+    
+    board = "📋 <b>आज के तीनों ट्रेड्स का रिजल्ट:</b>\n\n"
     for t in daily_trades_log:
-        board += f"• <b>Trade #{t['id']} ({t['index']} - {t['strike']}):</b> {t['status']}\n  <i>(Strategy: {t['strategy']})</i>\n"
-    return board
+        board += f"👉 <b>Trade #{t['id']} ({t['strike']}):</b>\n   {t['status']}\n\n"
+    return board.strip()
 
 def check_telegram_commands():
     global last_update_id
@@ -61,7 +74,7 @@ def check_telegram_commands():
             for result in response.get("result", []):
                 last_update_id = result["update_id"]
                 msg_text = result.get("message", {}).get("text", "").strip().lower()
-                if msg_text in ["/status", "status", "/start"]:
+                if msg_text in ["/status", "status", "/start", "start"]:
                     send_live_market_summary()
     except Exception:
         pass
@@ -142,30 +155,32 @@ def evaluate_multi_strategies(df):
         orb_low  = float(first_15m['Low'].min())
 
     if price > vwap and price > ema20 and ema20 > ema50 and 56 < rsi < 72 and macd > macd_sig:
-        return "BUY CALL (CE)", "CALL", "Strategy 1: Institutional Trend + MACD Crossover"
+        return "BUY CALL (CE)", "CALL", "Trend + MACD Breakout"
     if price < vwap and price < ema20 and ema20 < ema50 and 28 < rsi < 44 and macd < macd_sig:
-        return "BUY PUT (PE)", "PUT", "Strategy 1: Institutional Downtrend + MACD Breakdown"
+        return "BUY PUT (PE)", "PUT", "Downtrend + MACD Breakdown"
 
     if orb_high and orb_low:
         if prev['Close'] <= orb_high and price > orb_high and price > vwap and rsi > 58:
-            return "BUY CALL (CE)", "CALL", "Strategy 2: Morning ORB (15-Min High Breakout)"
+            return "BUY CALL (CE)", "CALL", "Morning 15-Min High Breakout"
         if prev['Close'] >= orb_low and price < orb_low and price < vwap and rsi < 42:
-            return "BUY PUT (PE)", "PUT", "Strategy 2: Morning ORB (15-Min Low Breakdown)"
+            return "BUY PUT (PE)", "PUT", "Morning 15-Min Low Breakdown"
 
     if prev['Close'] <= prev['BB_Upper'] and price > bb_upper and rsi > 60 and macd > macd_sig and price > open_p:
-        return "BUY CALL (CE)", "CALL", "Strategy 3: Bollinger Band Blast (Momentum Breakout)"
+        return "BUY CALL (CE)", "CALL", "Bollinger Band Fast Breakout"
     if prev['Close'] >= prev['BB_Lower'] and price < bb_lower and rsi < 40 and macd < macd_sig and price < open_p:
-        return "BUY PUT (PE)", "PUT", "Strategy 3: Bollinger Band Blast (Selling Breakdown)"
+        return "BUY PUT (PE)", "PUT", "Bollinger Band Fast Breakdown"
 
     if ema20 > ema50 and price > vwap and low_p <= ema20 and price > ema20 and price > open_p and 52 < rsi < 68:
-        return "BUY CALL (CE)", "CALL", "Strategy 4: 20 EMA + VWAP Pullback Bounce (Sniper Entry)"
+        return "BUY CALL (CE)", "CALL", "20 EMA + VWAP Support Bounce"
     if ema20 < ema50 and price < vwap and high_p >= ema20 and price < ema20 and price < open_p and 32 < rsi < 48:
-        return "BUY PUT (PE)", "PUT", "Strategy 4: 20 EMA + VWAP Pullback Rejection (Sniper Entry)"
+        return "BUY PUT (PE)", "PUT", "20 EMA + VWAP Resistance Drop"
 
     return None, None, None
 
 def send_live_market_summary():
-    report = "📊 <b>LIVE MULTI-STRATEGY MARKET REPORT</b> 📊\n\n"
+    market_state = "🟢 मार्केट अभी खुला है (LIVE)" if is_market_open() else "🔴 मार्केट अभी बंद है (CLOSED)"
+    report = f"📊 <b>MARKET STATUS REPORT</b> 📊\n\n📢 <b>Status:</b> {market_state}\n\n"
+    
     for name, info in INDICES.items():
         try:
             df = yf.Ticker(info["symbol"]).history(period="5d", interval="5m")
@@ -176,17 +191,27 @@ def send_live_market_summary():
             price = float(latest['Close'])
             rsi = float(latest['RSI'])
             adx = float(latest['ADX']) if not np.isnan(latest['ADX']) else 15.0
-            mood = "⚠️ साइडवेज (Range-Bound)" if adx < ADX_THRESHOLD else "🔥 ट्रेंडिंग (Strong Move)"
-            report += f"🔹 <b>{name}:</b> {price:.2f}\n   • मूड: {mood} (ADX: {adx:.1f} | RSI: {rsi:.1f})\n\n"
+            mood = "⚠️ साइडवेज (Range)" if adx < ADX_THRESHOLD else "🔥 ट्रेंडिंग (Fast Move)"
+            
+            report += (
+                f"🔹 <b>{name}:</b> {price:.0f}\n"
+                f"   • मूड: {mood} (RSI: {rsi:.0f})\n\n"
+            )
         except Exception:
-            report += f"🔹 <b>{name}:</b> डेटा लोड हो रहा है...\n\n"
-    report += f"🛡️ <b>आज के ट्रेंडिंग ट्रेड:</b> {trades_today}/{MAX_TRADES_PER_DAY}\n\n"
+            report += f"🔹 <b>{name}:</b> लोड हो रहा है...\n\n"
+            
+    report += f"🛡️ <b>आज के कुल ट्रेड:</b> {trades_today} / {MAX_TRADES_PER_DAY}\n\n"
     report += get_trades_scoreboard()
     send_telegram_message(report)
 
-def check_active_trades_sl_target(index_name, current_high, current_low):
+def check_active_trades_sl_target(index_name, candle_time, current_high, current_low):
+    """सिर्फ नई कैंडल आने पर ही चेक करेगा कि चल रहे ट्रेड का टारगेट या स्टॉप-लॉस हिट हुआ या नहीं"""
     for trade in daily_trades_log:
         if trade["index"] == index_name and trade["is_open"]:
+            # जिस कैंडल पर एंट्री हुई है, उसी कैंडल पर तुरंत SL/Target हिट न माने (अगली कैंडल से चेक करे)
+            if candle_time <= trade["entry_candle_time"]:
+                continue
+
             hit_type = None
             if trade["direction"] == "CALL":
                 if current_high >= trade["target"]:
@@ -201,45 +226,49 @@ def check_active_trades_sl_target(index_name, current_high, current_low):
 
             if hit_type == "TARGET":
                 trade["is_open"] = False
-                trade["status"] = f"✅ TARGET HIT (+₹{trade['expected_profit']:.0f} Profit)"
-                last_alert_sent[index_name] = None
+                trade["status"] = f"✅ TARGET HIT (+₹{trade['expected_profit']:.0f} प्रॉफिट)"
+                
                 update_msg = (
-                    f"🎯 <b>TRADE #{trade['id']} UPDATE: TARGET HIT!</b> 🎯\n\n"
-                    f"📊 <b>Index:</b> {trade['index']}\n"
-                    f"🧠 <b>Strategy:</b> {trade['strategy']}\n"
-                    f"⚡ <b>Trade:</b> {trade['action']} ({trade['strike']})\n"
-                    f"📍 <b>Entry:</b> {trade['entry']:.2f}  ➡️  <b>Target Hit:</b> {trade['target']:.2f}\n"
-                    f"💰 <b>Result:</b> <b>✅ TARGET HIT (अनुमानित मुनाफा: +₹{trade['expected_profit']:.0f})</b>\n"
-                    f"📢 <b>सलाह:</b> बधाई हो! Zerodha Kite में अपना पूरा प्रॉफिट बुक कर लें।\n\n"
+                    f"🎯 <b>TRADE #{trade['id']} : TARGET HIT!</b> 🎯\n\n"
+                    f"📊 <b>Index:</b> {trade['index']}\n\n"
+                    f"⚡ <b>Trade:</b> {trade['strike']}\n\n"
+                    f"📍 <b>Entry:</b> {trade['entry']:.0f}  ➡️  <b>Target Hit:</b> {trade['target']:.0f}\n\n"
+                    f"💰 <b>Result:</b> <b>✅ TARGET HIT (+₹{trade['expected_profit']:.0f} प्रॉफिट)</b>\n\n"
+                    f"📢 <b>सलाह:</b> बहुत बढ़िया! अपना प्रॉफिट बुक कर लें।\n\n"
+                    f"────────────────────\n\n"
                     f"{get_trades_scoreboard()}"
                 )
                 send_telegram_message(update_msg)
 
             elif hit_type == "SL":
                 trade["is_open"] = False
-                trade["status"] = f"🛑 STOP-LOSS HIT (-₹{trade['max_risk']:.0f} Loss)"
-                last_alert_sent[index_name] = None
+                trade["status"] = f"🛑 STOP-LOSS HIT (-₹{trade['max_risk']:.0f} लॉस)"
+                
                 update_msg = (
-                    f"🛑 <b>TRADE #{trade['id']} UPDATE: STOP-LOSS HIT!</b> 🛑\n\n"
-                    f"📊 <b>Index:</b> {trade['index']}\n"
-                    f"🧠 <b>Strategy:</b> {trade['strategy']}\n"
-                    f"⚡ <b>Trade:</b> {trade['action']} ({trade['strike']})\n"
-                    f"📍 <b>Entry:</b> {trade['entry']:.2f}  ➡️  <b>SL Hit:</b> {trade['sl']:.2f}\n"
-                    f"⚠️ <b>Result:</b> <b>🛑 STOP-LOSS HIT (अनुमानित लॉस: -₹{trade['max_risk']:.0f})</b>\n"
-                    f"📢 <b>सलाह:</b> डिसिप्लिन बनाए रखें और तुरंत ट्रेड से बाहर निकल जाएं।\n\n"
+                    f"🛑 <b>TRADE #{trade['id']} : STOP-LOSS HIT!</b> 🛑\n\n"
+                    f"📊 <b>Index:</b> {trade['index']}\n\n"
+                    f"⚡ <b>Trade:</b> {trade['strike']}\n\n"
+                    f"📍 <b>Entry:</b> {trade['entry']:.0f}  ➡️  <b>SL Hit:</b> {trade['sl']:.0f}\n\n"
+                    f"⚠️ <b>Result:</b> <b>🛑 STOP-LOSS HIT (-₹{trade['max_risk']:.0f} लॉस)</b>\n\n"
+                    f"📢 <b>सलाह:</b> स्टॉप-लॉस हिट हो गया है, तुरंत ट्रेड से बाहर निकल जाएं।\n\n"
+                    f"────────────────────\n\n"
                     f"{get_trades_scoreboard()}"
                 )
                 send_telegram_message(update_msg)
 
 def scan_market():
-    global trades_today, current_day, last_alert_sent, daily_trades_log
+    global trades_today, current_day, last_candle_traded, daily_trades_log
+
+    # अगर मार्केट बंद है (शनिवार/रविवार या 9:15 से पहले / 3:30 के बाद), तो कोई ट्रेड न ले
+    if not is_market_open():
+        return
 
     today = get_ist_now().date()
     if today != current_day:
         current_day = today
         trades_today = 0
         daily_trades_log = []
-        last_alert_sent = {name: None for name in INDICES}
+        last_candle_traded = {name: None for name in INDICES}
 
     for name, info in INDICES.items():
         try:
@@ -249,6 +278,7 @@ def scan_market():
 
             df = calculate_indicators(df)
             latest = df.iloc[-1]
+            candle_time = df.index[-1]
 
             price  = float(latest['Close'])
             high_p = float(latest['High'])
@@ -256,29 +286,38 @@ def scan_market():
             atr    = float(latest['ATR'])
             adx    = float(latest['ADX']) if not np.isnan(latest['ADX']) else 15.0
 
-            check_active_trades_sl_target(name, high_p, low_p)
+            # 1. पहले चल रहे ट्रेड्स का Target या Stop-Loss चेक करें
+            check_active_trades_sl_target(name, candle_time, high_p, low_p)
 
+            # 2. अगर इस इंडेक्स में पहले से कोई ट्रेड चल रहा है, तो नया न दें
             if any(t["index"] == name and t["is_open"] for t in daily_trades_log):
                 continue
+
+            # 3. अगर दिन के कुल 3 ट्रेड पूरे हो चुके हैं, तो नया ट्रेड बिल्कुल न दें
             if trades_today >= MAX_TRADES_PER_DAY:
+                continue
+
+            # 4. एक ही कैंडल पर बार-बार ट्रेड लेने से रोकें
+            if last_candle_traded[name] == candle_time:
                 continue
 
             is_sideways = (adx < ADX_THRESHOLD) or is_lunch_chop_time()
             signal, direction, strategy_used = evaluate_multi_strategies(df)
 
-            if signal and last_alert_sent[name] != signal:
-                last_alert_sent[name] = signal
+            if signal:
+                last_candle_traded[name] = candle_time
+                trades_today += 1
 
-                sl_points = round(atr * 1.2, 2)
+                sl_points = round(atr * 1.2, 0)
                 rr_ratio = 2.0 if is_sideways else 2.5
-                target_points = round(sl_points * rr_ratio, 2)
+                target_points = round(sl_points * rr_ratio, 0)
 
                 if direction == "CALL":
-                    sl_level = round(price - sl_points, 2)
-                    target_level = round(price + target_points, 2)
+                    sl_level = price - sl_points
+                    target_level = price + target_points
                 else:
-                    sl_level = round(price + sl_points, 2)
-                    target_level = round(price - target_points, 2)
+                    sl_level = price + sl_points
+                    target_level = price - target_points
 
                 step = 100 if name in ["BANK NIFTY", "SENSEX"] else 50
                 atm_strike = round(price / step) * step
@@ -286,34 +325,27 @@ def scan_market():
                 kite_search = f"{info['kite_name']} {atm_strike} {opt_type}"
 
                 max_risk_rs = TOTAL_CAPITAL * (RISK_PER_TRADE_PCT / 100)
-                est_opt_sl = max(5, round(sl_points * 0.5, 1))
+                est_opt_sl = max(5, round(sl_points * 0.5, 0))
                 risk_per_lot = est_opt_sl * info["lot_size"]
 
                 if is_sideways:
                     lots = 1
-                    header = "⚠️ <b>SIDEWAYS MARKET SIGNAL (सावधानी रखें)</b> ⚠️"
+                    header = f"⚠️ <b>SIDEWAYS MARKET SIGNAL (Trade {trades_today} of {MAX_TRADES_PER_DAY})</b> ⚠️"
                     status_note = (
-                        "📢 <b>मार्केट स्टेटस:</b> मार्केट अभी साइडवेज (Range-Bound) है!\n"
-                        "💡 <b>सलाह:</b> यहाँ ऑप्शन का प्रीमियम गलने (Theta Decay) का खतरा रहता है। "
-                        "<b>अगर आप अपनी मर्जी से ट्रेड लेना चाहें तो ले सकते हैं</b>, लेकिन बहुत कम रिस्क या 1 लॉट के साथ ही करें।\n"
+                        "📢 <b>Market Mood:</b> मार्केट अभी साइडवेज (धीमा) है!\n\n"
+                        "💡 <b>सलाह:</b> मार्केट साइडवेज है, आप अपनी मर्जी से ट्रेड लेना चाहें तो ले सकते हैं (सिर्फ 1 लॉट से करें)।"
                     )
-                    trend_tag = f"ADX: {adx:.1f} - साइडवेज/कमजोर ट्रेंड"
-                    lot_text = "सिर्फ 1 Lot (साइडवेज सेफ्टी)"
+                    lot_text = "1 Lot (साइडवेज सेफ्टी)"
                 else:
-                    trades_today += 1
                     lots = max(1, int(max_risk_rs // risk_per_lot))
-                    header = f"🚨 <b>HIGH PROBABILITY SIGNAL (TRADE #{trades_today})</b> 🚨"
-                    status_note = (
-                        "📢 <b>मार्केट स्टेटस:</b> मार्केट पूरी तरह ट्रेंडिंग (Strong Momentum) है! "
-                        "यह ट्रेड हाई-प्रोबेबिलिटी मल्टी-स्ट्रैटेजी सेटअप में आता है।\n"
-                    )
-                    trend_tag = f"ADX: {adx:.1f} - मजबूत ट्रेंड"
-                    lot_text = f"{lots} Lot(s)"
+                    header = f"🚨 <b>NEW TRADE SIGNAL (Trade {trades_today} of {MAX_TRADES_PER_DAY})</b> 🚨"
+                    status_note = "📢 <b>Market Mood:</b> मार्केट अभी तेज ट्रेंड में है (Strong Trend)!"
+                    lot_text = f"{lots} Lot"
 
                 total_risk = lots * risk_per_lot
                 expected_prof = total_risk * rr_ratio
 
-                trade_id = len(daily_trades_log) + 1
+                trade_id = trades_today
                 daily_trades_log.append({
                     "id": trade_id,
                     "index": name,
@@ -326,26 +358,27 @@ def scan_market():
                     "target": target_level,
                     "max_risk": total_risk,
                     "expected_profit": expected_prof,
+                    "entry_candle_time": candle_time,
                     "is_open": True,
                     "status": "⏳ RUNNING (चल रहा है)"
                 })
 
                 msg = (
                     f"{header}\n\n"
-                    f"{status_note}\n"
-                    f"📊 <b>Index:</b> {name} (<i>{trend_tag}</i>)\n"
-                    f"🧠 <b>Matched Strategy:</b> <b>{strategy_used}</b>\n"
-                    f"⚡ <b>Action:</b> {signal}\n"
-                    f"🔍 <b>Zerodha Kite Search:</b> <code>{kite_search}</code>\n\n"
-                    f"📍 <b>Spot Entry:</b> {price:.2f}\n"
-                    f"🛑 <b>Spot Stop-Loss:</b> {sl_level:.2f} (<i>-{sl_points} pts</i>)\n"
-                    f"✅ <b>Spot Target (1:{rr_ratio}):</b> {target_level:.2f} (<i>+{target_points} pts</i>)\n\n"
-                    f"🛡️ <b>DISCIPLINE & RISK MANAGEMENT:</b>\n"
-                    f"• <b>Recommended Lots:</b> {lot_text}\n"
-                    f"• <b>Option SL (Approx):</b> {est_opt_sl} Points नीचे\n"
-                    f"• <b>Max Risk on Trade:</b> ₹{total_risk:.0f}\n"
-                    f"• <b>Expected Profit:</b> ₹{expected_prof:.0f}\n"
-                    f"• <b>Trending Trade Count:</b> {trades_today}/{MAX_TRADES_PER_DAY}\n\n"
+                    f"{status_note}\n\n"
+                    f"📊 <b>Index:</b> {name}\n\n"
+                    f"🧠 <b>Setup:</b> {strategy_used}\n\n"
+                    f"⚡ <b>Action:</b> <b>{signal}</b>\n\n"
+                    f"🔍 <b>Zerodha Search:</b> <code>{kite_search}</code>\n\n"
+                    f"📍 <b>Spot Entry:</b> {price:.0f}\n\n"
+                    f"🛑 <b>Stop-Loss:</b> {sl_level:.0f} (<i>-{sl_points:.0f} pts</i>)\n\n"
+                    f"🎯 <b>Target:</b> {target_level:.0f} (<i>+{target_points:.0f} pts</i>)\n\n"
+                    f"💼 <b>Risk & Lot Guide:</b>\n\n"
+                    f"• <b>कितने लॉट लें:</b> {lot_text}\n\n"
+                    f"• <b>ऑप्शन का SL:</b> प्रीमियम से {est_opt_sl:.0f} पॉइंट नीचे\n\n"
+                    f"• <b>अधिकतम रिस्क:</b> ₹{total_risk:.0f}\n\n"
+                    f"• <b>अनुमानित प्रॉफिट:</b> ₹{expected_prof:.0f}\n\n"
+                    f"────────────────────\n\n"
                     f"{get_trades_scoreboard()}"
                 )
                 send_telegram_message(msg)
@@ -354,16 +387,17 @@ def scan_market():
             print(f"Error scanning {name}: {e}")
 
 if __name__ == "__main__":
+    mkt_msg = "🟢 मार्केट अभी खुला है, लाइव स्कैनिंग शुरू है।" if is_market_open() else "🔴 अभी मार्केट बंद है। सोमवार सुबह 9:15 AM से अपने आप ट्रेड आएंगे।"
+    
     send_telegram_message(
-        "☁️ <b>GitHub Cloud Bot Active!</b>\n\n"
-        "✅ आपका बॉट अब क्लाउड सर्वर पर चालू हो चुका है (लैपटॉप बंद कर सकते हैं)।\n"
-        "✅ 4-in-1 Multi-Strategy + Live Target/SL Scoreboard ऑन है।\n"
-        "💡 कभी भी लाइव हाल जानने के लिए <b>/status</b> लिखकर भेजें।"
+        "🤖 <b>MyTrader Bot Active!</b>\n\n"
+        f"📢 <b>Status:</b> {mkt_msg}\n\n"
+        "✅ दिन में सिर्फ 3 बेस्ट ट्रेड आएंगे।\n\n"
+        "💡 मार्केट का हाल देखने के लिए कभी भी <b>/status</b> लिखकर भेजें।"
     )
     
     start_run = time.time()
     last_scan_time = 0
-    # GitHub Actions पर एक सेशन में 5.5 घंटे (पूरे मार्केट टाइम 9:15 AM से 3:30 PM) तक लगातार चलेगा
     while time.time() - start_run < 19800:
         check_telegram_commands()
         if time.time() - last_scan_time >= 15:
