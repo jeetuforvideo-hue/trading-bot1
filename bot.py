@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 # =====================================================================
 # 1. आपकी पर्सनल और सिक्योर सेटिंग्स
 # =====================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9166955310:AAFQzHViDc6nwjC1QAgKDEOzPeDfq5PK2_U")
+BOT_TOKEN = os.getenv("BOT_TOKEN") 
 CHAT_ID   = "5610520408"  # सिर्फ आपकी टेलीग्राम आईडी पर काम करेगा
 
 TOTAL_CAPITAL      = 100000
