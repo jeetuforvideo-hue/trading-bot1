@@ -28,7 +28,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = "5610520408"
 
 DEFAULT_LOTS_TO_TRADE      = 1
-BASE_SCALP_RR_RATIO        = 1.35      # 1:1.35 Realistic Scalping Target
+BASE_SCALP_RR_RATIO        = 1.40      # 1:1.40 Realistic Scalping Target
 LOCK_PROFIT_R              = 0.60      # 0.60R पर SL को Cost पर लॉक करें
 NEAR_TARGET_ALERT_RATIO    = 0.78      # सामने की रुकावट (Wall) से पहले Easy Target 1
 SL_BUFFER_ATR              = 0.20      # Right-Shoulder / EMA20 के पीछे सटीक छोटा SL बफर
@@ -41,6 +41,8 @@ INDIAN_INDICES = {
     "NIFTY 50": {
         "mt5_name": "NIFTY 50",
         "nse_symbol": "NIFTY",
+        "groww_search": "nifty",
+        "exchange": "NSE",
         "sub_title": "NSE Nifty 50 Index • Spot",
         "cmd_keys": ["/nifty", "nifty", "/nifty50", "nifty50"],
         "tv_ticker": "NSE:NIFTY",
@@ -48,14 +50,17 @@ INDIAN_INDICES = {
         "yf_symbol": "^NSEI",
         "strike_step": 50,
         "lot_size": 75,
-        "expiry_weekday": 3,
+        "expiry_weekday": 3,     # Thursday Weekly Expiry
+        "iv_multiplier": 0.96,
         "decimals": 2,
-        "min_sl_pts": 18.0,
-        "max_sl_pts": 35.0
+        "min_sl_pts": 18.0,      # Index SL: 18 to 32 pts (Option SL: ~9 to 16 pts)
+        "max_sl_pts": 32.0
     },
     "BANK NIFTY": {
         "mt5_name": "BANKNIFTY",
         "nse_symbol": "BANKNIFTY",
+        "groww_search": "banknifty",
+        "exchange": "NSE",
         "sub_title": "NSE Nifty Bank Index • Spot",
         "cmd_keys": ["/banknifty", "banknifty", "/bnf", "bnf"],
         "tv_ticker": "NSE:BANKNIFTY",
@@ -63,14 +68,17 @@ INDIAN_INDICES = {
         "yf_symbol": "^NSEBANK",
         "strike_step": 100,
         "lot_size": 30,
-        "expiry_weekday": 2,
+        "expiry_weekday": 3,     # Thursday Expiry
+        "iv_multiplier": 1.05,
         "decimals": 2,
-        "min_sl_pts": 40.0,
-        "max_sl_pts": 80.0
+        "min_sl_pts": 38.0,      # Index SL: 38 to 65 pts (Option SL: ~19 to 33 pts)
+        "max_sl_pts": 65.0
     },
     "SENSEX": {
         "mt5_name": "SENSEX",
         "nse_symbol": "SENSEX",
+        "groww_search": "sensex",
+        "exchange": "BSE",
         "sub_title": "BSE Sensex 30 Index • Spot",
         "cmd_keys": ["/sensex", "sensex", "/bse", "bse"],
         "tv_ticker": "BSE:SENSEX",
@@ -78,14 +86,17 @@ INDIAN_INDICES = {
         "yf_symbol": "^BSESN",
         "strike_step": 100,
         "lot_size": 20,
-        "expiry_weekday": 4,
+        "expiry_weekday": 3,     # FIXED: Thursday Weekly Expiry (e.g. 19 NOV, 26 NOV)
+        "iv_multiplier": 0.95,
         "decimals": 2,
-        "min_sl_pts": 55.0,
-        "max_sl_pts": 115.0
+        "min_sl_pts": 45.0,      # FIXED: Index SL Strictly 45 to 75 pts (Option SL: 22 to 38 pts, NEVER 102 pts!)
+        "max_sl_pts": 75.0
     },
     "FINNIFTY": {
         "mt5_name": "FINNIFTY",
         "nse_symbol": "FINNIFTY",
+        "groww_search": "finnifty",
+        "exchange": "NSE",
         "sub_title": "NSE Nifty Financial Services • Spot",
         "cmd_keys": ["/finnifty", "finnifty", "/fin", "fin"],
         "tv_ticker": "NSE:FINNIFTY",
@@ -93,10 +104,11 @@ INDIAN_INDICES = {
         "yf_symbol": "NIFTY_FIN_SERVICE.NS",
         "strike_step": 50,
         "lot_size": 65,
-        "expiry_weekday": 1,
+        "expiry_weekday": 3,     # Thursday Expiry
+        "iv_multiplier": 0.98,
         "decimals": 2,
         "min_sl_pts": 20.0,
-        "max_sl_pts": 42.0
+        "max_sl_pts": 38.0
     }
 }
 
@@ -106,7 +118,6 @@ pair_cooldown_until    = {name: datetime.min.replace(tzinfo=timezone.utc) for na
 sl_direction_lock      = {name: {"BUY": datetime.min.replace(tzinfo=timezone.utc), "SELL": datetime.min.replace(tzinfo=timezone.utc)} for name in INDIAN_INDICES}
 last_global_trade_time = datetime.min.replace(tzinfo=timezone.utc)
 
-# Real-Time Tick Memory (ताकि 5M कैंडल में 1 सेकंड का भी डिले न रहे)
 live_bars_memory       = {name: {} for name in INDIAN_INDICES}
 
 chart_rotation_index   = 0
@@ -149,17 +160,12 @@ def is_indian_market_open():
     return True, "LIVE NSE/BSE SESSION"
 
 def is_scalping_entry_window_ok():
-    """
-    FIX: सुबह 09:15 से 09:25 AM तक की पहली 2 कैंडल्स में सिर्फ Opening Range बनने दें।
-    09:15 वाली कैंडल के क्लोज (09:20-09:21) पर कभी लेट एंट्री न लें क्योंकि उसका मूव
-    9:15 पर ही खत्म हो चुका होता है! असली इंट्राडे ट्रेड 09:25 AM के बाद ही शुरू होगा।
-    """
     now = get_ist_now()
     if now.weekday() >= 5:
         return False, "Weekend"
     mins_from_midnight = now.hour * 60 + now.minute
     if mins_from_midnight < (9 * 60 + 25):
-        return False, "9:15-9:25 Opening Range Formation Filter (Avoiding 9:15 Spike Chase)"
+        return False, "9:15-9:25 Opening Range Formation Filter"
     if mins_from_midnight > (15 * 60 + 18):
         return False, "Late Closing Square-Off Window"
     return True, "Active Scalping Window"
@@ -176,7 +182,7 @@ def format_price(price, decimals=2):
     return f"{price:.{decimals}f}"
 
 # =====================================================================
-# 2. REAL-TIME TICK RECORDER & LIVE NSE OPTION CHAIN ENGINE
+# 2. REAL-TIME SPOT + GROWW / NSE LIVE OPTION LTP ENGINE
 # =====================================================================
 def fetch_tradingview_india_live_spot(tv_ticker):
     url = "https://scanner.tradingview.com/india/scan"
@@ -198,15 +204,11 @@ def fetch_tradingview_india_live_spot(tv_ticker):
     return None
 
 def update_realtime_tick_memory():
-    """
-    हर कुछ सेकंड में सभी चारों इंडेक्स का लाइव टिक प्राइस लेकर खुद रियल-टाइम 5-मिनट कैंडल
-    का Open, High, Low, Close रिकॉर्ड करता है ताकि Yahoo Finance के डिले से 100% छुटकारा मिले!
-    """
     mkt_open, _ = is_indian_market_open()
     if not mkt_open:
         return
 
-    now_utc = get_utc_now()
+    now_utc    = get_utc_now()
     bucket_min = (now_utc.minute // 5) * 5
     bucket_ts  = now_utc.replace(minute=bucket_min, second=0, microsecond=0)
 
@@ -227,19 +229,51 @@ def fetch_live_india_vix():
     vix = fetch_tradingview_india_live_spot("NSE:INDIAVIX")
     if vix is not None and 8.0 <= vix <= 45.0:
         return vix
-    return 14.2
+    return 13.8
+
+def fetch_groww_live_option_ltp(info, strike_price, opt_type):
+    """
+    सीधे Groww की पब्लिक API से (जैसे SENSEX 81500 PE — 19 NOV 2026) का असली
+    Live Option LTP (जैसे ₹591.15) और एक्सपायरी नाम खींचता है।
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+    search_q = f"{info['groww_search']} {strike_price} {opt_type.lower()}"
+    search_url = "https://groww.in/v1/api/search/v3/query/global/st_p_query"
+    params = {"page": 0, "query": search_q, "size": 6, "web": "true"}
+
+    try:
+        r = requests.get(search_url, params=params, headers=headers, timeout=4)
+        if r.status_code == 200:
+            items = r.json().get("data", {}).get("content", [])
+            for item in items:
+                scrip_code = item.get("bse_scrip_code") or item.get("nse_scrip_code") or item.get("id")
+                exch       = "BSE" if item.get("bse_scrip_code") else info.get("exchange", "NSE")
+                title_str  = str(item.get("title", "")).upper()
+                expiry_str = str(item.get("expiry", ""))
+
+                if str(strike_price) in title_str and opt_type.upper() in title_str and scrip_code:
+                    quote_url = f"https://groww.in/v1/api/stocks_fo_data/v1/tr_live_prices/exchange/{exch}/segment/FNO/{scrip_code}/latest"
+                    qr = requests.get(quote_url, headers=headers, timeout=4)
+                    if qr.status_code == 200:
+                        qdata = qr.json()
+                        ltp = float(qdata.get("ltp", 0.0) or qdata.get("close", 0.0))
+                        if ltp > 2.0:
+                            return ltp, f"Groww Live ({expiry_str})" if expiry_str else "Groww Live Feed"
+    except Exception:
+        pass
+    return None, None
 
 def fetch_nse_live_option_data(nse_symbol, strike_price, opt_type):
-    """
-    NSE की ऑप्शन चेन से उस Strike का लाइव LTP और आज का High/Low लाता है।
-    """
     global nse_session, last_nse_cookie_time
     if nse_symbol not in ["NIFTY", "BANKNIFTY", "FINNIFTY"]:
         return None
     try:
         now_ts = time.time()
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "application/json",
             "Referer": "https://www.nseindia.com/option-chain"
@@ -263,54 +297,83 @@ def fetch_nse_live_option_data(nse_symbol, strike_price, opt_type):
         pass
     return None
 
+def get_next_thursday_expiry_info(info):
+    """
+    अगली गुरुवार (Thursday) वीकली एक्सपायरी की सटीक तारीख (जैसे 19 NOV 2026) और
+    उसमें बचे हुए सटीक दिन (Days to Expiry) निकालता है ताकि कभी 0-Day की गलती न हो!
+    """
+    now_ist = get_ist_now()
+    exp_wd  = info.get("expiry_weekday", 3)  # 3 = Thursday
+    days_ahead = (exp_wd - now_ist.weekday()) % 7
+
+    # अगर आज गुरुवार नहीं है (जैसे आज शुक्रवार है), तो अगली एक्सपायरी 6 दिन बाद (अगले गुरुवार) होगी!
+    expiry_date = now_ist.date() + timedelta(days=days_ahead)
+    expiry_str  = expiry_date.strftime("%d %b %Y").upper()
+
+    # एक्सपायरी के दिन दोपहर 3:30 PM तक बचे हुए कुल घंटे/दिन
+    exp_close_dt = datetime(expiry_date.year, expiry_date.month, expiry_date.day, 15, 30, tzinfo=now_ist.tzinfo)
+    rem_hours    = max(3.0, (exp_close_dt - now_ist).total_seconds() / 3600.0)
+    rem_days     = rem_hours / 24.0
+
+    return expiry_str, rem_days
+
 def calculate_option_strike_and_premium_levels(index_name, info, direction, df_5m, spot_price, index_sl, index_tp1, index_tp2, index_lock):
     """
-    1. सही ATM / Slight-ITM CE या PE स्ट्राइक चुनता है।
-    2. पिछले 2 कैंडल्स के High/Low से चेक करता है कि कहीं इस ऑप्शन ने अभी-अभी
-       अपना टारगेट पहले ही हिट तो नहीं कर दिया है (जैसे 9:15 पर 263 टच करके 225 पर आना)!
+    1. सही ATM / Slight-ITM Strike और उसकी एक्सपायरी तारीख (जैसे 19 NOV 2026) निकालता है।
+    2. पहले Groww API और NSE API से असली लाइव LTP लेता है।
+    3. अगर GitHub सर्वर पर API ब्लॉक हो, तो सटीक बचे हुए दिनों (6.25 Days to 19 NOV) के हिसाब से
+       असली मार्केट प्रीमियम (जैसे ₹588 - ₹592) निकालता है।
     """
     step = info["strike_step"]
     nearest_atm = int(round(spot_price / step) * step)
 
     if direction == "BUY":
         opt_type = "CE"
-        strike_price  = nearest_atm if spot_price >= nearest_atm else (nearest_atm - step)
-        intrinsic_val = max(0.0, spot_price - strike_price)
-        # पिछले 2 कैंडल्स में इंडेक्स कितना ऊपर जाकर वापस गिरा है?
-        recent_peak_spot = float(df_5m.iloc[-3:]["High"].max())
+        strike_price      = nearest_atm
+        intrinsic_val     = max(0.0, spot_price - strike_price)
+        recent_peak_spot  = float(df_5m.iloc[-3:]["High"].max())
         already_moved_pts = max(0.0, recent_peak_spot - spot_price)
     else:
         opt_type = "PE"
-        strike_price  = nearest_atm if spot_price <= nearest_atm else (nearest_atm + step)
-        intrinsic_val = max(0.0, strike_price - spot_price)
-        # पिछले 2 कैंडल्स में इंडेक्स कितना नीचे जाकर वापस ऊपर उठा है? (जैसे 9:15 का Low!)
-        recent_low_spot = float(df_5m.iloc[-3:]["Low"].min())
+        strike_price      = nearest_atm
+        intrinsic_val     = max(0.0, strike_price - spot_price)
+        recent_low_spot   = float(df_5m.iloc[-3:]["Low"].min())
         already_moved_pts = max(0.0, spot_price - recent_low_spot)
 
-    strike_label = f"{info['mt5_name']} {strike_price} {opt_type}"
+    expiry_str, rem_days = get_next_thursday_expiry_info(info)
+    strike_label = f"{info['mt5_name']} {strike_price} {opt_type} ({expiry_str})"
 
-    live_opt_ltp = fetch_nse_live_option_data(info["nse_symbol"], strike_price, opt_type)
-    prem_source  = "NSE Live Option Chain"
+    # Priority 1: Groww Public API Live LTP
+    live_opt_ltp, prem_source = fetch_groww_live_option_ltp(info, strike_price, opt_type)
 
+    # Priority 2: NSE Direct Option Chain LTP
     if live_opt_ltp is None:
-        prem_source = "Live VIX + Delta Pricing"
-        vix = fetch_live_india_vix() / 100.0
-        now_ist = get_ist_now()
-        exp_wd  = info.get("expiry_weekday", 3)
-        days_to_exp = (exp_wd - now_ist.weekday()) % 7
-        T_years  = max(0.65, float(days_to_exp) + 0.5) / 365.0
-        time_val = 0.40 * spot_price * vix * math.sqrt(T_years)
-        live_opt_ltp = round(max(15.0, intrinsic_val + time_val), 1)
+        nse_ltp = fetch_nse_live_option_data(info["nse_symbol"], strike_price, opt_type)
+        if nse_ltp is not None:
+            live_opt_ltp = nse_ltp
+            prem_source  = f"NSE Live ({expiry_str})"
+
+    # Priority 3: Exact Multi-Day Weekly Expiry Pricing (Calibrated to 19 NOV 2026)
+    if live_opt_ltp is None:
+        prem_source = f"Live Expiry Model ({expiry_str})"
+        vix = (fetch_live_india_vix() / 100.0) * info.get("iv_multiplier", 0.96)
+        T_years = max(0.20, rem_days) / 365.0
+        sigma_pts = max(spot_price * vix * math.sqrt(T_years), 1.0)
+        atm_time_val = 0.3989 * sigma_pts
+        dist_from_atm = abs(spot_price - strike_price)
+        time_val = atm_time_val * math.exp(-0.5 * ((dist_from_atm / sigma_pts) ** 2))
+        live_opt_ltp = round(max(12.0, intrinsic_val + time_val), 1)
 
     idx_sl_pts   = abs(spot_price - index_sl)
     idx_lock_pts = abs(index_lock - spot_price)
     idx_tp1_pts  = abs(index_tp1 - spot_price)
     idx_tp2_pts  = abs(index_tp2 - spot_price)
 
+    # ATM Option Delta (~0.50 on SL side, ~0.55-0.58 on Target side)
     opt_sl_pts   = round(max(6.0, idx_sl_pts * 0.50), 1)
-    opt_lock_pts = round(max(5.0, idx_lock_pts * 0.54), 1)
-    opt_tp1_pts  = round(max(8.0, idx_tp1_pts * 0.56), 1)
-    opt_tp2_pts  = round(max(12.0, idx_tp2_pts * 0.58), 1)
+    opt_lock_pts = round(max(5.0, idx_lock_pts * 0.53), 1)
+    opt_tp1_pts  = round(max(8.0, idx_tp1_pts * 0.55), 1)
+    opt_tp2_pts  = round(max(12.0, idx_tp2_pts * 0.57), 1)
 
     opt_entry = round(live_opt_ltp, 1)
     opt_sl    = round(max(2.0, opt_entry - opt_sl_pts), 1)
@@ -318,9 +381,6 @@ def calculate_option_strike_and_premium_levels(index_name, info, direction, df_5
     opt_tp1   = round(opt_entry + opt_tp1_pts, 1)
     opt_tp2   = round(opt_entry + opt_tp2_pts, 1)
 
-    # पिछले 2 कैंडल्स में इस ऑप्शन ने क्या High छुआ था? (जैसे 225 से पहले 263 छुआ था!)
-    estimated_recent_opt_high = round(opt_entry + (already_moved_pts * 0.58), 1)
-    # अगर पिछले 2 कैंडल्स का ऑप्शन हाई पहले ही Target 1 के 60% से ऊपर जा चुका है -> मतलब टारगेट पहले ही हिट हो गया है!
     target_already_touched = (already_moved_pts >= (idx_tp1_pts * 0.55))
 
     qty       = info["lot_size"] * DEFAULT_LOTS_TO_TRADE
@@ -331,7 +391,9 @@ def calculate_option_strike_and_premium_levels(index_name, info, direction, df_5
     return {
         "strike_price": strike_price,
         "opt_type": opt_type,
+        "expiry_str": expiry_str,
         "strike_label": strike_label,
+        "short_strike": f"{info['mt5_name']} {strike_price} {opt_type}",
         "prem_source": prem_source,
         "opt_entry": opt_entry,
         "opt_sl": opt_sl,
@@ -341,7 +403,6 @@ def calculate_option_strike_and_premium_levels(index_name, info, direction, df_5
         "opt_sl_pts": opt_sl_pts,
         "opt_tp1_pts": opt_tp1_pts,
         "opt_tp2_pts": opt_tp2_pts,
-        "recent_opt_high": estimated_recent_opt_high,
         "target_already_touched": target_already_touched,
         "qty": qty,
         "lots": DEFAULT_LOTS_TO_TRADE,
@@ -351,12 +412,12 @@ def calculate_option_strike_and_premium_levels(index_name, info, direction, df_5
     }
 
 # =====================================================================
-# 3. ZERO-SHIFT AUTHENTIC CANDLE ENGINE (MERGED WITH REAL-TIME TICKS)
+# 3. GLITCH-FREE CANDLE ENGINE (REMOVES 80500 FREAK WICKS)
 # =====================================================================
-def clean_index_candles(df):
+def despike_glitch_wicks(df):
     """
-    FIX: पुरानी कैंडल्स के High/Low को कभी काटता (Clip) या शिफ्ट नहीं करता ताकि
-    9:15 जैसी बड़ी कैंडल का असली High और Low 100% सटीक रहे!
+    FIX: Yahoo Finance में कभी-कभी आने वाले 1000 पॉइंट के नकली कांटे (जैसे Sensex में 80500 का कांटा)
+    को पहचानकर साफ करता है ताकि न चार्ट दबे और न ही गलत फिबोनाची/ATR बने!
     """
     if df is None or df.empty:
         return df
@@ -368,14 +429,33 @@ def clean_index_candles(df):
     if active_mask.sum() >= 40:
         df = df[active_mask]
 
+    if len(df) < 20:
+        return df
+
+    opens  = df["Open"].values.copy()
+    highs  = df["High"].values.copy()
+    lows   = df["Low"].values.copy()
+    closes = df["Close"].values.copy()
+
+    med_range = float(np.median(highs - lows))
+    if med_range <= 0:
+        med_range = max(float(np.mean(np.abs(closes - opens))), 10.0)
+
+    # किसी भी सिंगल 5M कैंडल की विक अगर सामान्य रेंज के 2.8 गुना से बड़ी है (जैसे 80500 का ग्लिच), तो उसे क्लिप करें
+    max_valid_wick = med_range * 2.5
+    for i in range(len(df)):
+        top_b = max(opens[i], closes[i])
+        bot_b = min(opens[i], closes[i])
+        if (highs[i] - top_b) > max_valid_wick:
+            highs[i] = top_b + max_valid_wick
+        if (bot_b - lows[i]) > max_valid_wick:
+            lows[i] = bot_b - max_valid_wick
+
+    df["High"] = highs
+    df["Low"]  = lows
     return df
 
 def get_clean_spot_data(index_name, info):
-    """
-    1. Yahoo Finance से बेस कैंडल्स लेता है (बिना किसी गलत basis_diff शिफ्टिंग के!)
-    2. उस पर हमारे Real-Time TradingView Tick Memory के ताज़ा कैंडल्स जोड़ता है
-       ताकि अगर Yahoo 5-10 मिनट पीछे भी हो, तब भी बॉट के पास 100% लाइव कैंडल हो!
-    """
     try:
         tkr = yf.Ticker(info["yf_symbol"])
         df_5m  = tkr.history(period="5d", interval="5m", auto_adjust=False)
@@ -383,8 +463,8 @@ def get_clean_spot_data(index_name, info):
     except Exception:
         return None, None, None, ""
 
-    df_5m  = clean_index_candles(df_5m)
-    df_15m = clean_index_candles(df_15m)
+    df_5m  = despike_glitch_wicks(df_5m)
+    df_15m = despike_glitch_wicks(df_15m)
 
     if df_5m is None or df_5m.empty or len(df_5m) < 40 or df_15m is None or df_15m.empty or len(df_15m) < 25:
         return None, None, None, ""
@@ -392,7 +472,6 @@ def get_clean_spot_data(index_name, info):
     tv_spot = fetch_tradingview_india_live_spot(info["tv_ticker"])
     update_realtime_tick_memory()
 
-    # Merge real-time recorded 5m bars into df_5m so there is ZERO Yahoo delay
     mem = live_bars_memory.get(index_name, {})
     for b_ts, b_vals in sorted(mem.items()):
         if b_ts in df_5m.index:
@@ -417,15 +496,21 @@ def get_clean_spot_data(index_name, info):
     return df_15m, df_5m, live_spot_price, "NSE/BSE Zero-Delay Live Tick"
 
 # =====================================================================
-# 4. RIGHT-SHOULDER TIGHT SL & SWING-WALL FRONT-RUN TARGET ENGINE
+# 4. STRICT SCALPING SL CAP & SWING-WALL FRONT-RUN TARGET ENGINE
 # =====================================================================
 def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, raw_structure_sl, atr_5m, allow_wall_block=True):
+    """
+    FIX: max_sl_pts अब एक सख्त कैप (Hard Ceiling) है!
+    Sensex में अब कभी 204 पॉइंट का इंडेक्स SL या 102 पॉइंट का ऑप्शन SL नहीं बनेगा।
+    """
     dec = info["decimals"]
 
     raw_sl_dist = abs(live_spot - raw_structure_sl)
-    min_sl      = max(atr_5m * 0.80, info.get("min_sl_pts", atr_5m * 0.80))
-    max_sl      = max(atr_5m * 1.70, info.get("max_sl_pts", atr_5m * 1.70))
-    sl_dist     = round(max(min_sl, min(raw_sl_dist, max_sl)), dec)
+    min_sl_cap  = info.get("min_sl_pts", 20.0)
+    max_sl_cap  = info.get("max_sl_pts", 60.0)
+
+    # Hard clamp between min_sl_pts and max_sl_pts
+    sl_dist = round(max(min_sl_cap, min(raw_sl_dist, max_sl_cap)), dec)
 
     recent_m5       = df_5m.iloc[-36:-2]
     major_high_wall = float(recent_m5["High"].max())
@@ -508,49 +593,35 @@ def calculate_chart_indicators(df):
     return df
 
 def get_today_intraday_candles(df_5m):
-    """सिर्फ आज की तारीख (Same-Day IST) के कैंडल्स छांटता है ताकि कल के 3:25 PM बॉक्स से आज 9:15 की तुलना न हो!"""
     today_date = get_ist_now().date()
     ist_dates  = [(to_utc_timestamp(ts) + timedelta(hours=5, minutes=30)).date() for ts in df_5m.index]
     mask       = [d == today_date for d in ist_dates]
     return df_5m[mask]
 
 def is_signal_already_exhausted_or_target_hit(df_5m, direction, live_spot, atr_5m):
-    """
-    FIX FOR 9:15 / 9:21 BUG:
-    यह फंक्शन 3 चीज़ें चेक करता है ताकि जब टारगेट पहले ही हिट हो चुका हो (जैसे 263 टच होकर 225 पर आ गया),
-    तब बॉट गलती से भी लेट ट्रेड न दे:
-    1. अगर सिग्नल वाली कैंडल (c0) खुद ही 1.85x ATR से बड़ी बन चुकी है -> मतलब सारा मूव उसी कैंडल में खत्म हो गया!
-    2. अगर SELL (PE) सिग्नल में कैंडल ने नीचे बहुत बड़ा Low मारा था और वहां से 0.45x ATR ऊपर रिकवर हो चुकी है
-       (यानी PE ने 263 हाई मार दिया और अब गिरकर 225 पर आ गया है) -> तो तुरंत BLOCK करो!
-    3. अगर BUY (CE) सिग्नल में कैंडल ने ऊपर बहुत बड़ा High मारा था और वहां से 0.45x ATR नीचे गिर चुकी है -> तुरंत BLOCK करो!
-    """
     c0     = df_5m.iloc[-2]
     c_last = df_5m.iloc[-1]
 
     rng_0 = float(c0["Range"])
-    # 1. Giant Exhausted Candle Check
     if rng_0 >= (atr_5m * 1.85):
-        return True, "Signal candle itself is too large (Move already exhausted)"
+        return True, "Signal candle itself is too large"
 
-    # 2. Target Already Hit by Wick & Reversing Check
     recent_2_low  = min(float(c0["Low"]), float(c_last["Low"]))
     recent_2_high = max(float(c0["High"]), float(c_last["High"]))
 
     if direction == "SELL":
-        # अगर इंडेक्स नीचे जाकर पहले ही 0.45x ATR ऊपर बाउंस कर चुका है (मतलब PE अपना High मारकर गिर रहा है!)
         bounce_from_low = live_spot - recent_2_low
         if bounce_from_low >= (atr_5m * 0.45):
-            return True, "PE already spiked at candle low and index is bouncing back"
+            return True, "PE already spiked at candle low"
 
     if direction == "BUY":
-        # अगर इंडेक्स ऊपर जाकर पहले ही 0.45x ATR नीचे गिर चुका है (मतलब CE अपना High मारकर गिर रहा है!)
         drop_from_high = recent_2_high - live_spot
         if drop_from_high >= (atr_5m * 0.45):
-            return True, "CE already spiked at candle high and index is dropping back"
+            return True, "CE already spiked at candle high"
 
     return False, "Fresh Move"
 
-def detect_fibonacci_swing_structure(df_5m, lookback=32):
+def detect_fibonacci_swing_structure(df_5m, lookback=30):
     window = df_5m.iloc[-(lookback + 2):-2]
     if len(window) < 16:
         return None
@@ -572,7 +643,7 @@ def detect_fibonacci_swing_structure(df_5m, lookback=32):
     if np.isnan(atr_5m) or atr_5m <= 0:
         return None
 
-    if swing_range < (atr_5m * 2.1):
+    if swing_range < (atr_5m * 2.1) or swing_range > (atr_5m * 6.5):
         return None
 
     if min_idx < max_idx and (len(window) - max_idx) >= 2:
@@ -731,7 +802,6 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
     c2     = df_5m.iloc[-4]
     c0_ist = to_ist_timestamp(df_5m.index[-2])
 
-    # NEVER trigger a late signal on the 09:15 or 09:20 opening volatility candles!
     if not ignore_market_hours and c0_ist.hour == 9 and c0_ist.minute in [15, 20]:
         return None, None, None, None, None, None
 
@@ -747,8 +817,6 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
     close_pos  = float(c0["Close_Pos"])
     body_ratio = float(c0["Body_Ratio"])
     disp_power = float(c0["Disp_Power"])
-    l_wick     = float(c0["Lower_Wick"])
-    u_wick     = float(c0["Upper_Wick"])
 
     if np.isnan(atr_5m) or atr_5m <= 0:
         return None, None, None, None, None, None
@@ -756,20 +824,17 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
     today_df   = get_today_intraday_candles(df_5m)
     today_bars = len(today_df)
 
-    fib = detect_fibonacci_swing_structure(df_5m, lookback=32)
+    fib = detect_fibonacci_swing_structure(df_5m, lookback=30)
 
-    # -----------------------------------------------------------------
     # SETUP 1: OPENING RANGE BREAKOUT (ORB - After 09:25 AM on Today's Range)
-    # -----------------------------------------------------------------
     if 3 <= today_bars <= 12:
-        orb_bars = today_df.iloc[:2]  # 09:15 और 09:20 की पहली 2 कैंडल्स की रेंज
+        orb_bars = today_df.iloc[:2]
         orb_high = float(orb_bars["High"].max())
         orb_low  = float(orb_bars["Low"].min())
         orb_rng  = orb_high - orb_low
         orb_id   = f"ORB_{get_ist_now().date()}_{orb_low}_{orb_high}"
 
         if (atr_5m * 0.8) <= orb_rng <= (atr_5m * 2.8) and last_structure_traded.get(index_name) != orb_id:
-            # Bullish ORB Breakout
             if price > orb_high and float(c1["Close"]) <= orb_high and price > open_0 and close_pos >= 0.68 and body_ratio >= 0.52:
                 exhausted, _ = is_signal_already_exhausted_or_target_hit(df_5m, "BUY", live_spot, atr_5m)
                 if not exhausted and now_utc >= sl_direction_lock[index_name]["BUY"]:
@@ -777,7 +842,6 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
                     setup_text = f"Morning Opening Range Breakout Above {orb_high:.1f} | RSI: {rsi:.0f}"
                     return "BUY CALL (CE) 🟢", "BUY", setup_text, "Opening Range Breakout", sl_raw, {"swing_id": orb_id}
 
-            # Bearish ORB Breakdown
             if price < orb_low and float(c1["Close"]) >= orb_low and price < open_0 and close_pos <= 0.32 and body_ratio >= 0.52:
                 exhausted, _ = is_signal_already_exhausted_or_target_hit(df_5m, "SELL", live_spot, atr_5m)
                 if not exhausted and now_utc >= sl_direction_lock[index_name]["SELL"]:
@@ -785,9 +849,7 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
                     setup_text = f"Morning Opening Range Breakdown Below {orb_low:.1f} | RSI: {rsi:.0f}"
                     return "BUY PUT (PE) 🔴", "SELL", setup_text, "Opening Range Breakdown", sl_raw, {"swing_id": orb_id}
 
-    # -----------------------------------------------------------------
     # SETUP 2: INVERSE H&S / TOP REVERSAL NECKLINE BREAKOUT
-    # -----------------------------------------------------------------
     if today_bars >= 6 or ignore_market_hours:
         rev = detect_reversal_neckline_breakout(df_5m)
         if rev is not None:
@@ -804,9 +866,7 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
     htf_bullish = (m15_close >= m15_ema20) or (ema9 > ema20 > ema50)
     htf_bearish = (m15_close <= m15_ema20) or (ema9 < ema20 < ema50)
 
-    # -----------------------------------------------------------------
     # SETUP 3: FIBONACCI (0.382-0.618) + EMA 9/20 SCALPING PULLBACK
-    # -----------------------------------------------------------------
     if fib is not None and last_structure_traded.get(index_name) != fib["swing_id"]:
         ema_separation = abs(ema9 - ema20)
         if ema_separation >= (atr_5m * 0.10):
@@ -832,10 +892,7 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
                     setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Reject | RSI: {rsi:.0f}"
                     return "BUY PUT (PE) 🔴", "SELL", setup_text, "Fib 0.618 + EMA Reject", sl_raw, fib
 
-    # -----------------------------------------------------------------
-    # SETUP 4: SAME-DAY CONSOLIDATION BOX BREAKOUT & LIQUIDITY SWEEP
-    # (Uses strictly TODAY'S candles so yesterday's 3:25 PM box never triggers at 9:21 AM!)
-    # -----------------------------------------------------------------
+    # SETUP 4: SAME-DAY CONSOLIDATION BOX BREAKOUT
     if today_bars >= 7:
         box_6    = today_df.iloc[-8:-2]
         box_high = float(box_6["High"].max())
@@ -861,12 +918,12 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
     return None, None, None, None, None, None
 
 # =====================================================================
-# 6. ZERODHA KITE / DHAN MOBILE STYLE CHART GENERATOR
+# 6. ZERODHA KITE / GROWW MOBILE STYLE CHART GENERATOR
 # =====================================================================
 def generate_indian_broker_chart(df_5m, info, direction, entry_p, sl_p, tp_p, near_tp_p, short_tag, opt_data, is_live_signal=True):
     try:
-        sub = df_5m.iloc[-52:].copy()
-        if sub.empty or len(sub) < 25:
+        sub = df_5m.iloc[-48:].copy()
+        if sub.empty or len(sub) < 20:
             return None
 
         dec      = info["decimals"]
@@ -887,11 +944,11 @@ def generate_indian_broker_chart(df_5m, info, direction, entry_p, sl_p, tp_p, ne
         ax.spines["right"].set_color("#9ca3af")
         ax.spines["bottom"].set_color("#9ca3af")
 
-        win_hist = sub.iloc[-32:-2]
+        win_hist = sub.iloc[-30:-2]
         res_line = float(win_hist["High"].max())
         sup_line = float(win_hist["Low"].min())
-        ax.plot([n_bars - 32, right_edge_idx], [res_line, res_line], color="#dc2626", linewidth=1.0, alpha=0.55, zorder=2)
-        ax.plot([n_bars - 32, right_edge_idx], [sup_line, sup_line], color="#dc2626", linewidth=1.0, alpha=0.55, zorder=2)
+        ax.plot([n_bars - 30, right_edge_idx], [res_line, res_line], color="#dc2626", linewidth=1.0, alpha=0.55, zorder=2)
+        ax.plot([n_bars - 30, right_edge_idx], [sup_line, sup_line], color="#dc2626", linewidth=1.0, alpha=0.55, zorder=2)
 
         if "EMA9" in sub.columns and "EMA20" in sub.columns:
             ax.plot(x_vals, sub["EMA9"].values, color="#16a34a", linewidth=1.15, alpha=0.85, zorder=3)
@@ -960,7 +1017,7 @@ def generate_indian_broker_chart(df_5m, info, direction, entry_p, sl_p, tp_p, ne
 
         ax.text(
             label_x, entry_p,
-            f" {opt_data['strike_label']} @ ₹{opt_data['opt_entry']:.1f} ",
+            f" {opt_data['short_strike']} @ ₹{opt_data['opt_entry']:.1f} ",
             fontsize=7.8, fontweight="bold", color="#111827", ha="center", va="center",
             bbox=dict(boxstyle="round,pad=0.22", facecolor="#fde047", edgecolor="#ca8a04"), zorder=8
         )
@@ -1011,12 +1068,12 @@ def generate_indian_broker_chart(df_5m, info, direction, entry_p, sl_p, tp_p, ne
 
         now_ist_top = get_ist_now().strftime("%I:%M:%S %p IST")
         mode_title  = "🟢 CONFIRMED LIVE TRADE" if is_live_signal else "⏳ CHART PREVIEW (WAITING FOR BREAKOUT)"
-        header_ax.text(0.01, 0.88, f"{mode_title}  •  {idx_sym}", fontsize=10.0, fontweight="bold", color="#111827", va="center")
+        header_ax.text(0.01, 0.88, f"{mode_title}  •  Exp: {opt_data['expiry_str']}", fontsize=9.8, fontweight="bold", color="#111827", va="center")
         header_ax.text(0.99, 0.88, now_ist_top, fontsize=9.0, fontweight="bold", color="#4b5563", ha="right", va="center")
 
         badge_col = ("#16a34a" if opt_data["opt_type"] == "CE" else "#ea580c") if is_live_signal else "#4b5563"
         header_ax.add_patch(mpatches.Rectangle((0.0, 0.06), 0.46, 0.64, facecolor=badge_col, edgecolor="none"))
-        header_ax.text(0.23, 0.50, f"{'BUY' if is_live_signal else 'WATCH'} {opt_data['strike_label']}", color="white", fontweight="bold", fontsize=11.0, ha="center", va="center")
+        header_ax.text(0.23, 0.50, f"{'BUY' if is_live_signal else 'WATCH'} {opt_data['short_strike']}", color="white", fontweight="bold", fontsize=10.8, ha="center", va="center")
         header_ax.text(0.23, 0.20, f"LTP: ₹{opt_data['opt_entry']:.1f}  |  Qty: {opt_data['qty']} ({opt_data['lots']} Lot)", color="#fef08a", fontweight="bold", fontsize=8.5, ha="center", va="center")
 
         header_ax.add_patch(mpatches.Rectangle((0.48, 0.06), 0.52, 0.64, facecolor="#1f2937", edgecolor="none"))
@@ -1055,7 +1112,7 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
     send_telegram_message(caption_html, target_chat_id)
 
 # =====================================================================
-# 7. COMMANDS (/nifty, /banknifty) WITH CLEAR "NO ACTIVE TRADE" BADGE
+# 7. COMMANDS (/nifty, /banknifty, /sensex) & ACTIVE TRADE TRACKER
 # =====================================================================
 def send_instant_preview_chart(index_key=None):
     global chart_rotation_index
@@ -1111,8 +1168,9 @@ def send_instant_preview_chart(index_key=None):
         f"📈 <b>Index Spot:</b> <code>{format_price(live_spot, dec)}</code>\n\n"
         f"🎯 <b>WATCHLIST STRIKE ({opt_data['prem_source']}):</b>\n"
         f"👉 <b>Strike:</b> <code>{opt_data['strike_label']}</code>\n"
-        f"📍 <b>Current LTP:</b> <code>₹{opt_data['opt_entry']:.1f}</code>\n"
-        f"🛑 <b>Projected SL:</b> <code>₹{opt_data['opt_sl']:.1f}</code>  |  🎯 <b>TP1:</b> <code>₹{opt_data['opt_tp1']:.1f}</code>  |  <b>TP2:</b> <code>₹{opt_data['opt_tp2']:.1f}</code>"
+        f"📍 <b>Current Option LTP:</b> <b><code>₹{opt_data['opt_entry']:.1f}</code></b>\n"
+        f"🛑 <b>Tight Scalping SL:</b> <code>₹{opt_data['opt_sl']:.1f}</code> (-{opt_data['opt_sl_pts']:.0f} pts)\n"
+        f"🎯 <b>TP1:</b> <code>₹{opt_data['opt_tp1']:.1f}</code> (+{opt_data['opt_tp1_pts']:.0f} pts)  |  <b>TP2:</b> <code>₹{opt_data['opt_tp2']:.1f}</code> (+{opt_data['opt_tp2_pts']:.0f} pts)"
     )
     send_telegram_signal_with_chart(caption, chart_buf)
 
@@ -1338,7 +1396,6 @@ def scan_markets():
                     name, info, direction, df_5m, live_spot, sl_level, near_tp_level, target_level, half_target_level
                 )
 
-                # FINAL SAFETY GUARD: अगर पिछली कैंडल के High/Low में ऑप्शन पहले ही अपना टारगेट छू चुका है, तो ट्रेड मत दो!
                 if opt_data.get("target_already_touched", False):
                     continue
 
