@@ -3,12 +3,13 @@ import io
 import sys
 import math
 import time
+import calendar
 import subprocess
 import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 
 try:
     import matplotlib
@@ -37,6 +38,16 @@ MAX_CONCURRENT_TRADES      = 2
 MIN_GAP_BETWEEN_TRADES_MIN = 10
 DAILY_MAX_SL_COUNT         = 3
 
+# NSE / BSE OFFICIAL TRADING HOLIDAYS (ताकि छुट्टी वाले दिन एक्सपायरी अपने-आप 1 दिन पहले शिफ्ट हो जाए, जैसे 24 Nov -> 23 Nov)
+NSE_BSE_HOLIDAYS = {
+    date(2026, 11, 24),  # Guru Nanak Jayanti (इसी वजह से 24 Nov की जगह 23 Nov 2026 को एक्सपायरी है)
+    date(2026, 12, 25),  # Christmas
+    date(2027, 1, 26),   # Republic Day
+    date(2027, 3, 8),    # Mahashivratri
+    date(2027, 3, 22),   # Holi
+}
+
+# हर इंडेक्स का अपना अलग एक्सपायरी नियम और 2026 का सही Lot Size
 INDIAN_INDICES = {
     "NIFTY 50": {
         "mt5_name": "NIFTY 50",
@@ -49,11 +60,11 @@ INDIAN_INDICES = {
         "tv_screener": "india",
         "yf_symbol": "^NSEI",
         "strike_step": 50,
-        "lot_size": 75,
-        "expiry_weekday": 3,     # Thursday Weekly Expiry
+        "lot_size": 65,                   # 2026 NSE Nifty Lot Size = 65
+        "expiry_mode": "WEEKLY_TUE",      # हर मंगलवार वीकली एक्सपायरी (17 NOV, 23 NOV...)
         "iv_multiplier": 0.96,
         "decimals": 2,
-        "min_sl_pts": 18.0,      # Index SL: 18 to 32 pts (Option SL: ~9 to 16 pts)
+        "min_sl_pts": 18.0,
         "max_sl_pts": 32.0
     },
     "BANK NIFTY": {
@@ -67,11 +78,11 @@ INDIAN_INDICES = {
         "tv_screener": "india",
         "yf_symbol": "^NSEBANK",
         "strike_step": 100,
-        "lot_size": 30,
-        "expiry_weekday": 3,     # Thursday Expiry
+        "lot_size": 30,                   # 2026 NSE BankNifty Lot Size = 30
+        "expiry_mode": "MONTHLY_LAST_TUE",# महीने का आखिरी मंगलवार (23 NOV 2026, 29 DEC 2026...)
         "iv_multiplier": 1.05,
         "decimals": 2,
-        "min_sl_pts": 38.0,      # Index SL: 38 to 65 pts (Option SL: ~19 to 33 pts)
+        "min_sl_pts": 38.0,
         "max_sl_pts": 65.0
     },
     "SENSEX": {
@@ -85,11 +96,11 @@ INDIAN_INDICES = {
         "tv_screener": "india",
         "yf_symbol": "^BSESN",
         "strike_step": 100,
-        "lot_size": 20,
-        "expiry_weekday": 3,     # FIXED: Thursday Weekly Expiry (e.g. 19 NOV, 26 NOV)
+        "lot_size": 20,                   # BSE Sensex Lot Size = 20
+        "expiry_mode": "WEEKLY_THU",      # हर गुरुवार वीकली एक्सपायरी (19 NOV 2026, 26 NOV 2026...)
         "iv_multiplier": 0.95,
         "decimals": 2,
-        "min_sl_pts": 45.0,      # FIXED: Index SL Strictly 45 to 75 pts (Option SL: 22 to 38 pts, NEVER 102 pts!)
+        "min_sl_pts": 45.0,
         "max_sl_pts": 75.0
     },
     "FINNIFTY": {
@@ -103,8 +114,8 @@ INDIAN_INDICES = {
         "tv_screener": "india",
         "yf_symbol": "NIFTY_FIN_SERVICE.NS",
         "strike_step": 50,
-        "lot_size": 65,
-        "expiry_weekday": 3,     # Thursday Expiry
+        "lot_size": 60,                   # 2026 NSE Finnifty Lot Size = 60
+        "expiry_mode": "MONTHLY_LAST_TUE",# महीने का आखिरी मंगलवार (23 NOV 2026, 29 DEC 2026...)
         "iv_multiplier": 0.98,
         "decimals": 2,
         "min_sl_pts": 20.0,
@@ -150,8 +161,8 @@ current_day = get_ist_now().date()
 
 def is_indian_market_open():
     now = get_ist_now()
-    if now.weekday() >= 5:
-        return False, "Weekend Closed (Sat-Sun)"
+    if now.weekday() >= 5 or now.date() in NSE_BSE_HOLIDAYS:
+        return False, "Market Holiday / Weekend"
     hr_min = now.hour + (now.minute / 60.0)
     if hr_min < 9.25:
         return False, "Pre-Market (Opens at 09:15 AM IST)"
@@ -161,8 +172,8 @@ def is_indian_market_open():
 
 def is_scalping_entry_window_ok():
     now = get_ist_now()
-    if now.weekday() >= 5:
-        return False, "Weekend"
+    if now.weekday() >= 5 or now.date() in NSE_BSE_HOLIDAYS:
+        return False, "Holiday / Weekend"
     mins_from_midnight = now.hour * 60 + now.minute
     if mins_from_midnight < (9 * 60 + 25):
         return False, "9:15-9:25 Opening Range Formation Filter"
@@ -182,7 +193,70 @@ def format_price(price, decimals=2):
     return f"{price:.{decimals}f}"
 
 # =====================================================================
-# 2. REAL-TIME SPOT + GROWW / NSE LIVE OPTION LTP ENGINE
+# 2. EXACT INDEX-WISE EXPIRY CALCULATOR (NIFTY / SENSEX / BANKNIFTY / FINNIFTY)
+# =====================================================================
+def adjust_for_nse_holiday(exp_date):
+    """अगर एक्सपायरी के दिन छुट्टी या वीकेंड है (जैसे 24 Nov 2026), तो उसे पिछले ट्रेडिंग दिन (23 Nov 2026) पर शिफ्ट करता है"""
+    while exp_date.weekday() >= 5 or exp_date in NSE_BSE_HOLIDAYS:
+        exp_date -= timedelta(days=1)
+    return exp_date
+
+def get_last_weekday_of_month(year, month, target_weekday):
+    """महीने का आखिरी मंगलवार (weekday=1) या आखिरी गुरुवार (weekday=3) निकालता है और छुट्टी होने पर 1 दिन पहले शिफ्ट करता है"""
+    last_day_num = calendar.monthrange(year, month)[1]
+    d = date(year, month, last_day_num)
+    while d.weekday() != target_weekday:
+        d -= timedelta(days=1)
+    return adjust_for_nse_holiday(d)
+
+def get_index_exact_expiry_info(info):
+    """
+    हर इंडेक्स के अपने अलग नियम के अनुसार उसकी बिल्कुल सटीक अगली एक्सपायरी तारीख निकालता है:
+    - NIFTY 50     -> WEEKLY_TUE (हर मंगलवार, छुट्टी हो तो सोमवार — जैसे 17 NOV 2026, फिर 23 NOV 2026)
+    - SENSEX       -> WEEKLY_THU (हर गुरुवार — जैसे 19 NOV 2026, फिर 26 NOV 2026)
+    - BANK NIFTY   -> MONTHLY_LAST_TUE (महीने का आखिरी मंगलवार — जैसे 23 NOV 2026, फिर 29 DEC 2026)
+    - FINNIFTY     -> MONTHLY_LAST_TUE (महीने का आखिरी मंगलवार — जैसे 23 NOV 2026, फिर 29 DEC 2026)
+    """
+    now_ist = get_ist_now()
+    today_d = now_ist.date()
+    mode    = info.get("expiry_mode", "WEEKLY_TUE")
+
+    if mode == "WEEKLY_TUE":
+        days_ahead = (1 - today_d.weekday()) % 7
+        candidate  = adjust_for_nse_holiday(today_d + timedelta(days=days_ahead))
+        if candidate < today_d or (candidate == today_d and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 30))):
+            next_tue  = today_d + timedelta(days=days_ahead + 7)
+            candidate = adjust_for_nse_holiday(next_tue)
+        expiry_date = candidate
+
+    elif mode == "WEEKLY_THU":
+        days_ahead = (3 - today_d.weekday()) % 7
+        candidate  = adjust_for_nse_holiday(today_d + timedelta(days=days_ahead))
+        if candidate < today_d or (candidate == today_d and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 30))):
+            next_thu  = today_d + timedelta(days=days_ahead + 7)
+            candidate = adjust_for_nse_holiday(next_thu)
+        expiry_date = candidate
+
+    elif mode == "MONTHLY_LAST_TUE":
+        candidate = get_last_weekday_of_month(today_d.year, today_d.month, 1)  # 1 = Tuesday
+        if candidate < today_d or (candidate == today_d and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 30))):
+            nxt_year  = today_d.year + (1 if today_d.month == 12 else 0)
+            nxt_month = 1 if today_d.month == 12 else (today_d.month + 1)
+            candidate = get_last_weekday_of_month(nxt_year, nxt_month, 1)
+        expiry_date = candidate
+
+    else:
+        expiry_date = today_d
+
+    expiry_str   = expiry_date.strftime("%d %b %Y").upper()
+    exp_close_dt = datetime(expiry_date.year, expiry_date.month, expiry_date.day, 15, 30, tzinfo=now_ist.tzinfo)
+    rem_hours    = max(3.0, (exp_close_dt - now_ist).total_seconds() / 3600.0)
+    rem_days     = rem_hours / 24.0
+
+    return expiry_date, expiry_str, rem_days
+
+# =====================================================================
+# 3. REAL-TIME SPOT + GROWW / NSE LIVE OPTION LTP ENGINE
 # =====================================================================
 def fetch_tradingview_india_live_spot(tv_ticker):
     url = "https://scanner.tradingview.com/india/scan"
@@ -231,18 +305,20 @@ def fetch_live_india_vix():
         return vix
     return 13.8
 
-def fetch_groww_live_option_ltp(info, strike_price, opt_type):
+def fetch_groww_live_option_ltp(info, strike_price, opt_type, target_expiry_date):
     """
-    सीधे Groww की पब्लिक API से (जैसे SENSEX 81500 PE — 19 NOV 2026) का असली
-    Live Option LTP (जैसे ₹591.15) और एक्सपायरी नाम खींचता है।
+    Groww की पब्लिक API से ठीक उसी इंडेक्स की सही एक्सपायरी (जैसे FINNIFTY के लिए 23 NOV,
+    NIFTY के लिए 17 NOV, SENSEX के लिए 19 NOV) का असली लाइव प्रीमियम खींचता है।
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json"
     }
+    day_s   = target_expiry_date.strftime("%d")
+    mon_s   = target_expiry_date.strftime("%b").upper()
     search_q = f"{info['groww_search']} {strike_price} {opt_type.lower()}"
     search_url = "https://groww.in/v1/api/search/v3/query/global/st_p_query"
-    params = {"page": 0, "query": search_q, "size": 6, "web": "true"}
+    params = {"page": 0, "query": search_q, "size": 8, "web": "true"}
 
     try:
         r = requests.get(search_url, params=params, headers=headers, timeout=4)
@@ -252,21 +328,23 @@ def fetch_groww_live_option_ltp(info, strike_price, opt_type):
                 scrip_code = item.get("bse_scrip_code") or item.get("nse_scrip_code") or item.get("id")
                 exch       = "BSE" if item.get("bse_scrip_code") else info.get("exchange", "NSE")
                 title_str  = str(item.get("title", "")).upper()
-                expiry_str = str(item.get("expiry", ""))
+                expiry_raw = str(item.get("expiry", "")).upper()
 
-                if str(strike_price) in title_str and opt_type.upper() in title_str and scrip_code:
+                # चेक करें कि स्ट्राइक और एक्सपायरी तारीख उस इंडेक्स की सही एक्सपायरी से मैच करे
+                date_matched = (day_s in title_str and mon_s in title_str) or (day_s in expiry_raw) or (not expiry_raw)
+                if str(strike_price) in title_str and opt_type.upper() in title_str and scrip_code and date_matched:
                     quote_url = f"https://groww.in/v1/api/stocks_fo_data/v1/tr_live_prices/exchange/{exch}/segment/FNO/{scrip_code}/latest"
                     qr = requests.get(quote_url, headers=headers, timeout=4)
                     if qr.status_code == 200:
                         qdata = qr.json()
                         ltp = float(qdata.get("ltp", 0.0) or qdata.get("close", 0.0))
                         if ltp > 2.0:
-                            return ltp, f"Groww Live ({expiry_str})" if expiry_str else "Groww Live Feed"
+                            return ltp
     except Exception:
         pass
-    return None, None
+    return None
 
-def fetch_nse_live_option_data(nse_symbol, strike_price, opt_type):
+def fetch_nse_live_option_data(nse_symbol, strike_price, opt_type, target_expiry_date):
     global nse_session, last_nse_cookie_time
     if nse_symbol not in ["NIFTY", "BANKNIFTY", "FINNIFTY"]:
         return None
@@ -283,12 +361,13 @@ def fetch_nse_live_option_data(nse_symbol, strike_price, opt_type):
             nse_session.get("https://www.nseindia.com/option-chain", headers=headers, timeout=4)
             last_nse_cookie_time = now_ts
 
+        nse_exp_fmt = target_expiry_date.strftime("%d-%b-%Y")  # e.g. 23-Nov-2026 or 17-Nov-2026
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}"
         res = nse_session.get(url, headers=headers, timeout=4)
         if res.status_code == 200:
             records = res.json().get("records", {}).get("data", [])
             for row in records:
-                if int(row.get("strikePrice", 0)) == int(strike_price):
+                if int(row.get("strikePrice", 0)) == int(strike_price) and str(row.get("expiryDate", "")).lower() == nse_exp_fmt.lower():
                     leg = row.get(opt_type, {})
                     ltp = float(leg.get("lastPrice", 0.0))
                     if ltp > 1.0:
@@ -297,79 +376,54 @@ def fetch_nse_live_option_data(nse_symbol, strike_price, opt_type):
         pass
     return None
 
-def get_next_thursday_expiry_info(info):
-    """
-    अगली गुरुवार (Thursday) वीकली एक्सपायरी की सटीक तारीख (जैसे 19 NOV 2026) और
-    उसमें बचे हुए सटीक दिन (Days to Expiry) निकालता है ताकि कभी 0-Day की गलती न हो!
-    """
-    now_ist = get_ist_now()
-    exp_wd  = info.get("expiry_weekday", 3)  # 3 = Thursday
-    days_ahead = (exp_wd - now_ist.weekday()) % 7
-
-    # अगर आज गुरुवार नहीं है (जैसे आज शुक्रवार है), तो अगली एक्सपायरी 6 दिन बाद (अगले गुरुवार) होगी!
-    expiry_date = now_ist.date() + timedelta(days=days_ahead)
-    expiry_str  = expiry_date.strftime("%d %b %Y").upper()
-
-    # एक्सपायरी के दिन दोपहर 3:30 PM तक बचे हुए कुल घंटे/दिन
-    exp_close_dt = datetime(expiry_date.year, expiry_date.month, expiry_date.day, 15, 30, tzinfo=now_ist.tzinfo)
-    rem_hours    = max(3.0, (exp_close_dt - now_ist).total_seconds() / 3600.0)
-    rem_days     = rem_hours / 24.0
-
-    return expiry_str, rem_days
-
 def calculate_option_strike_and_premium_levels(index_name, info, direction, df_5m, spot_price, index_sl, index_tp1, index_tp2, index_lock):
-    """
-    1. सही ATM / Slight-ITM Strike और उसकी एक्सपायरी तारीख (जैसे 19 NOV 2026) निकालता है।
-    2. पहले Groww API और NSE API से असली लाइव LTP लेता है।
-    3. अगर GitHub सर्वर पर API ब्लॉक हो, तो सटीक बचे हुए दिनों (6.25 Days to 19 NOV) के हिसाब से
-       असली मार्केट प्रीमियम (जैसे ₹588 - ₹592) निकालता है।
-    """
     step = info["strike_step"]
     nearest_atm = int(round(spot_price / step) * step)
 
     if direction == "BUY":
-        opt_type = "CE"
+        opt_type          = "CE"
         strike_price      = nearest_atm
         intrinsic_val     = max(0.0, spot_price - strike_price)
         recent_peak_spot  = float(df_5m.iloc[-3:]["High"].max())
         already_moved_pts = max(0.0, recent_peak_spot - spot_price)
     else:
-        opt_type = "PE"
+        opt_type          = "PE"
         strike_price      = nearest_atm
         intrinsic_val     = max(0.0, strike_price - spot_price)
         recent_low_spot   = float(df_5m.iloc[-3:]["Low"].min())
         already_moved_pts = max(0.0, spot_price - recent_low_spot)
 
-    expiry_str, rem_days = get_next_thursday_expiry_info(info)
+    # हर इंडेक्स की अपनी असली एक्सपायरी तारीख (17 NOV / 19 NOV / 23 NOV) निकालें
+    expiry_date, expiry_str, rem_days = get_index_exact_expiry_info(info)
     strike_label = f"{info['mt5_name']} {strike_price} {opt_type} ({expiry_str})"
 
-    # Priority 1: Groww Public API Live LTP
-    live_opt_ltp, prem_source = fetch_groww_live_option_ltp(info, strike_price, opt_type)
+    # Priority 1: Groww Public API Live LTP for this exact expiry
+    live_opt_ltp = fetch_groww_live_option_ltp(info, strike_price, opt_type, expiry_date)
+    prem_source  = f"Groww Live ({expiry_str})"
 
-    # Priority 2: NSE Direct Option Chain LTP
+    # Priority 2: NSE Direct Option Chain LTP for this exact expiry
     if live_opt_ltp is None:
-        nse_ltp = fetch_nse_live_option_data(info["nse_symbol"], strike_price, opt_type)
+        nse_ltp = fetch_nse_live_option_data(info["nse_symbol"], strike_price, opt_type, expiry_date)
         if nse_ltp is not None:
             live_opt_ltp = nse_ltp
             prem_source  = f"NSE Live ({expiry_str})"
 
-    # Priority 3: Exact Multi-Day Weekly Expiry Pricing (Calibrated to 19 NOV 2026)
+    # Priority 3: Index-Specific Exact Expiry Pricing Model
     if live_opt_ltp is None:
-        prem_source = f"Live Expiry Model ({expiry_str})"
-        vix = (fetch_live_india_vix() / 100.0) * info.get("iv_multiplier", 0.96)
-        T_years = max(0.20, rem_days) / 365.0
-        sigma_pts = max(spot_price * vix * math.sqrt(T_years), 1.0)
-        atm_time_val = 0.3989 * sigma_pts
+        prem_source   = f"Expiry {expiry_str}"
+        vix           = (fetch_live_india_vix() / 100.0) * info.get("iv_multiplier", 0.96)
+        T_years       = max(0.20, rem_days) / 365.0
+        sigma_pts     = max(spot_price * vix * math.sqrt(T_years), 1.0)
+        atm_time_val  = 0.3989 * sigma_pts
         dist_from_atm = abs(spot_price - strike_price)
-        time_val = atm_time_val * math.exp(-0.5 * ((dist_from_atm / sigma_pts) ** 2))
-        live_opt_ltp = round(max(12.0, intrinsic_val + time_val), 1)
+        time_val      = atm_time_val * math.exp(-0.5 * ((dist_from_atm / sigma_pts) ** 2))
+        live_opt_ltp  = round(max(12.0, intrinsic_val + time_val), 1)
 
     idx_sl_pts   = abs(spot_price - index_sl)
     idx_lock_pts = abs(index_lock - spot_price)
     idx_tp1_pts  = abs(index_tp1 - spot_price)
     idx_tp2_pts  = abs(index_tp2 - spot_price)
 
-    # ATM Option Delta (~0.50 on SL side, ~0.55-0.58 on Target side)
     opt_sl_pts   = round(max(6.0, idx_sl_pts * 0.50), 1)
     opt_lock_pts = round(max(5.0, idx_lock_pts * 0.53), 1)
     opt_tp1_pts  = round(max(8.0, idx_tp1_pts * 0.55), 1)
@@ -412,13 +466,9 @@ def calculate_option_strike_and_premium_levels(index_name, info, direction, df_5
     }
 
 # =====================================================================
-# 3. GLITCH-FREE CANDLE ENGINE (REMOVES 80500 FREAK WICKS)
+# 4. GLITCH-FREE CANDLE ENGINE (REMOVES FREAK WICKS)
 # =====================================================================
 def despike_glitch_wicks(df):
-    """
-    FIX: Yahoo Finance में कभी-कभी आने वाले 1000 पॉइंट के नकली कांटे (जैसे Sensex में 80500 का कांटा)
-    को पहचानकर साफ करता है ताकि न चार्ट दबे और न ही गलत फिबोनाची/ATR बने!
-    """
     if df is None or df.empty:
         return df
     df = df.copy()
@@ -441,7 +491,6 @@ def despike_glitch_wicks(df):
     if med_range <= 0:
         med_range = max(float(np.mean(np.abs(closes - opens))), 10.0)
 
-    # किसी भी सिंगल 5M कैंडल की विक अगर सामान्य रेंज के 2.8 गुना से बड़ी है (जैसे 80500 का ग्लिच), तो उसे क्लिप करें
     max_valid_wick = med_range * 2.5
     for i in range(len(df)):
         top_b = max(opens[i], closes[i])
@@ -496,20 +545,15 @@ def get_clean_spot_data(index_name, info):
     return df_15m, df_5m, live_spot_price, "NSE/BSE Zero-Delay Live Tick"
 
 # =====================================================================
-# 4. STRICT SCALPING SL CAP & SWING-WALL FRONT-RUN TARGET ENGINE
+# 5. STRICT SCALPING SL CAP & SWING-WALL FRONT-RUN TARGET ENGINE
 # =====================================================================
 def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, raw_structure_sl, atr_5m, allow_wall_block=True):
-    """
-    FIX: max_sl_pts अब एक सख्त कैप (Hard Ceiling) है!
-    Sensex में अब कभी 204 पॉइंट का इंडेक्स SL या 102 पॉइंट का ऑप्शन SL नहीं बनेगा।
-    """
     dec = info["decimals"]
 
     raw_sl_dist = abs(live_spot - raw_structure_sl)
     min_sl_cap  = info.get("min_sl_pts", 20.0)
     max_sl_cap  = info.get("max_sl_pts", 60.0)
 
-    # Hard clamp between min_sl_pts and max_sl_pts
     sl_dist = round(max(min_sl_cap, min(raw_sl_dist, max_sl_cap)), dec)
 
     recent_m5       = df_5m.iloc[-36:-2]
@@ -560,7 +604,7 @@ def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, ra
     return sl_level, sl_dist, lock_level, near_tp_lvl, target_level, tp2_dist, actual_rr
 
 # =====================================================================
-# 5. TECHNICAL INDICATORS & ANTI-EXHAUSTION SCALPING SETUPS
+# 6. TECHNICAL INDICATORS & ANTI-EXHAUSTION SCALPING SETUPS
 # =====================================================================
 def calculate_chart_indicators(df):
     df = df.copy()
@@ -918,7 +962,7 @@ def evaluate_all_market_setups(index_name, info, df_15m, df_5m, live_spot, ignor
     return None, None, None, None, None, None
 
 # =====================================================================
-# 6. ZERODHA KITE / GROWW MOBILE STYLE CHART GENERATOR
+# 7. ZERODHA KITE / GROWW MOBILE STYLE CHART GENERATOR
 # =====================================================================
 def generate_indian_broker_chart(df_5m, info, direction, entry_p, sl_p, tp_p, near_tp_p, short_tag, opt_data, is_live_signal=True):
     try:
@@ -1112,7 +1156,7 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
     send_telegram_message(caption_html, target_chat_id)
 
 # =====================================================================
-# 7. COMMANDS (/nifty, /banknifty, /sensex) & ACTIVE TRADE TRACKER
+# 8. COMMANDS (/nifty, /banknifty, /sensex, /finnifty) & TRADE TRACKER
 # =====================================================================
 def send_instant_preview_chart(index_key=None):
     global chart_rotation_index
@@ -1191,11 +1235,12 @@ def send_live_status_summary():
                 continue
             df_5m = calculate_chart_indicators(df_5m)
             direction, _, short_tag, _ = analyze_real_price_action(df_5m, info, live_spot)
+            _, exp_str, _ = get_index_exact_expiry_info(info)
             step  = info["strike_step"]
             atm   = int(round(live_spot / step) * step)
             ce_pe = "CE" if direction == "BUY" else "PE"
             p_str = format_price(live_spot, info["decimals"])
-            report += f"🔹 <b>{name}:</b> <code>{p_str}</code> | Watch: <b>{atm} {ce_pe}</b> ({short_tag})\n"
+            report += f"🔹 <b>{name}:</b> <code>{p_str}</code> | <b>{atm} {ce_pe} ({exp_str})</b>\n"
         except Exception:
             pass
 
